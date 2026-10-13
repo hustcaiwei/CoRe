@@ -1,1 +1,2 @@
 # CoRe
+Coming Soon~
