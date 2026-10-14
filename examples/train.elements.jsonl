@@ -1,0 +1,2 @@
+{"id": "toy-train-1", "fact": "被告窃取财物，价值3000元，案发后退还。", "elements": {"behavior": "窃取他人财物", "consequence": "造成3000元财物损失，后退还", "fact": "被告窃取价值3000元的财物，案发后退还。"}, "labels": {"charge": ["盗窃"], "law_article": [264], "term_months": 6, "term_class": 9}}
+{"id": "toy-train-2", "fact": "被告虚构交易骗取财物，价值5000元。", "elements": {"behavior": "虚构交易骗取财物", "consequence": "造成5000元财物损失", "fact": "被告以虚构交易的方式骗取5000元财物。"}, "labels": {"charge": ["诈骗"], "law_article": [266], "term_months": 12, "term_class": 7}}

@@ -1,0 +1,20 @@
+{
+  "llm_model": "deepseek-v3",
+  "embedding_model": "text-embedding-ada-002",
+  "embedding_dimension": 1536,
+  "cee_temperature": 0.1,
+  "judge_a_temperature": 0.1,
+  "judge_b_temperature": 0.1,
+  "top_m": 5000,
+  "top_k": 19,
+  "alpha": 60,
+  "rpr_scope": "intersection",
+  "batch_size": 16,
+  "concurrency": 8,
+  "cee_evaluation_model": "deepseek-v4-pro",
+  "cee_repair_model": "deepseek-v4-flash",
+  "cee_evaluation_temperature": 0,
+  "cee_repair_temperature": 0,
+  "cee_evaluation_max_tokens": 4096,
+  "cee_keep_threshold": 4
+}

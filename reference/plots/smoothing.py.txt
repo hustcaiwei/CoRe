@@ -1,0 +1,130 @@
+import matplotlib.pyplot as plt
+from brokenaxes import brokenaxes
+import numpy as np
+
+# ---------------- 配置参数 ----------------
+bar_color = '#FFA500'
+line_color = 'g'
+marker_style = 'o'
+wi = 1.2
+
+title_font = {'family': 'Times New Roman', 'size': 18, 'weight': 'bold'}
+axis_font = {'family': 'Times New Roman', 'size': 16}
+legend_font = {'family': 'Times New Roman', 'size': 14, 'weight': 'bold'}
+line_width = 3.5
+tick_width = 1.5
+spine_width = 1.5
+value_font = {'family': 'Times New Roman', 'size': 12, 'weight': 'bold'}
+
+x_data = ['30','45','60','75']
+x_pos = np.arange(len(x_data))
+
+charge_acc = [87.27, 88.34, 88.51, 88.37]
+charge_f1 = [87.13, 87.14, 87.61, 87.25]
+
+law_acc = [87.93, 88.07, 88.22, 88.03]
+law_f1 = [82.10, 82.13, 82.37, 82.20]
+
+term_acc = [42.55, 42.77, 43.20, 43.07]
+term_f1 = [37.21, 37.35, 38.20, 37.39]
+
+fig = plt.figure(figsize=(3.4*3, 5), dpi=300)
+
+# ---------------- Charge 子图 ----------------
+ax1 = fig.add_subplot(1,3,1)
+ax1.plot(x_pos, charge_acc, marker=marker_style, markersize=7, color=line_color,
+         label='Acc', linewidth=line_width)
+bars1 = ax1.bar(x_pos, charge_f1, width=0.55, alpha=0.7, color=bar_color,
+                ec='black', lw=wi, label='F1')
+
+# 显示折线数值
+for i, v in enumerate(charge_acc):
+    ax1.text(i, v + 0.1, f"{v:.2f}", ha='center', va='bottom', fontdict=value_font)
+# 显示柱状图数值
+for i, bar in enumerate(bars1):
+    height = charge_f1[i]
+    ax1.text(bar.get_x() + bar.get_width()/2, height, f"{height:.2f}",
+             ha='center', va='bottom', fontdict=value_font)
+
+ax1.set_xticks(x_pos)
+ax1.set_xticklabels(x_data, fontdict=axis_font)
+ax1.set_ylim(86, 90)
+ax1.set_title('Charge', fontdict=title_font)
+ax1.set_ylabel('Value', fontdict=axis_font)
+ax1.legend(prop=legend_font)
+ax1.tick_params(axis='x', labelsize=14, width=tick_width)
+ax1.tick_params(axis='y', labelsize=14, width=tick_width)
+for spine in ax1.spines.values():
+    spine.set_linewidth(spine_width)
+ax1.spines['right'].set_visible(False)
+ax1.spines['top'].set_visible(False)
+
+# ---------------- Law 子图（断轴） ----------------
+bax2 = brokenaxes(
+    ylims=((81, 83), (87.5, 89)),
+    hspace=0.08,
+    d=0,
+    subplot_spec=fig.add_gridspec(1,3)[0,1]
+)
+bax2.plot(x_pos, law_acc, marker=marker_style, markersize=7, color=line_color,
+          label='Acc', linewidth=line_width)
+bars2 = bax2.bar(x_pos, law_f1, width=0.55, alpha=0.7, color=bar_color,
+                 ec='black', lw=wi, label='F1')
+
+# 显示折线数值 - 直接使用 bax2.text
+for i, v in enumerate(law_acc):
+    if i == 2:  # x=60 对应的88.22，放在下方
+        bax2.text(i, v - 0.1, f"{v:.2f}", ha='center', va='top', fontdict=value_font)
+    else:
+        bax2.text(i, v + 0.05, f"{v:.2f}", ha='center', va='bottom', fontdict=value_font)
+
+# 显示柱状图数值 - 直接使用 bax2.text
+for i, height in enumerate(law_f1):
+    bax2.text(i, height, f"{height:.2f}", ha='center', va='bottom', fontdict=value_font)
+
+for ax in bax2.axs:
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_data, fontdict=axis_font)
+    ax.tick_params(axis='x', labelsize=14, width=tick_width)
+    ax.tick_params(axis='y', labelsize=14, width=tick_width)
+    for spine in ax.spines.values():
+        spine.set_linewidth(spine_width)
+bax2.set_title('Law', fontdict=title_font)
+bax2.legend(prop=legend_font)
+
+# ---------------- Term 子图（断轴） ----------------
+bax3 = brokenaxes(
+    ylims=((36.5, 38.5), (42.5, 44)),
+    hspace=0.08,
+    d=0,
+    subplot_spec=fig.add_gridspec(1,3)[0,2]
+)
+bax3.plot(x_pos, term_acc, marker=marker_style, markersize=7, color=line_color,
+          label='Acc', linewidth=line_width)
+bars3 = bax3.bar(x_pos, term_f1, width=0.55, alpha=0.7, color=bar_color,
+                 ec='black', lw=wi, label='F1')
+
+# 显示折线数值 - 直接使用 bax3.text
+for i, v in enumerate(term_acc):
+    if i == 2:  # x=60 对应的43.20，放在下方
+        bax3.text(i, v - 0.1, f"{v:.2f}", ha='center', va='top', fontdict=value_font)
+    else:
+        bax3.text(i, v + 0.05, f"{v:.2f}", ha='center', va='bottom', fontdict=value_font)
+
+# 显示柱状图数值 - 直接使用 bax3.text
+for i, height in enumerate(term_f1):
+    bax3.text(i, height, f"{height:.2f}", ha='center', va='bottom', fontdict=value_font)
+
+for ax in bax3.axs:
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(x_data, fontdict=axis_font)
+    ax.tick_params(axis='x', labelsize=14, width=tick_width)
+    ax.tick_params(axis='y', labelsize=14, width=tick_width)
+    for spine in ax.spines.values():
+        spine.set_linewidth(spine_width)
+bax3.set_title('Term', fontdict=title_font)
+bax3.legend(prop=legend_font)
+
+plt.subplots_adjust(wspace=0.3, hspace=0.2, bottom=0.15)
+plt.savefig('smooth_fact.pdf')
+plt.show()

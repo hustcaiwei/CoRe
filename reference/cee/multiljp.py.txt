@@ -1,0 +1,173 @@
+import json
+import asyncio
+import time
+from tqdm import tqdm
+from tenacity import retry, stop_after_attempt, wait_fixed
+from openai import AsyncOpenAI  # 使用异步客户端
+import json_repair
+
+client = None
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+async def deepseek_query(case, id, relation, crime_info):
+    # 提供请求数据
+    instruction = """
+        你是一名法律信息抽取助手。请根据输入的刑事判决书文本，提取每名被告的"行为""后果""犯罪事实"。
+        案例文本：{case_text}
+        存在{number}名被告
+        【任务要求】
+        1. 输出 JSON 格式，键名必须是被告姓名（如"被告A"）。
+        2. 每个被告对应的字段如下：
+        - "行为": 被告在案件中的具体行为（如运输毒品、介绍交易、贩卖毒品等）。
+        - "后果": 行为直接造成的结果（如被查获毒品数量、犯罪未遂、配合抓捕等）。
+        - "犯罪事实": 法院最终认定的完整犯罪事实，应当包括：
+        - 定罪依据：说明被告触犯的具体罪名（如涉嫌开设赌场罪、非法放贷罪等），同时指出法院认定的法律条文或刑法条款依据；
+        - 具体情况：包括犯罪的数量、方式、时间、地点、参与角色等详细事实；
+        - 量刑情节：描述从犯/主犯、立功、未遂、初犯、认罪态度、涉案金额/数量、特殊情节等。
+        - 输出对象的键顺序按被告代号字母序排列（A、B、C…）。
+
+        【输出格式（示例，仅演示结构；实际输出的被告数量应与文本一致）】
+        {
+          "被告A": {
+            "行为": "",
+            "后果": "",
+            "犯罪事实": ""
+          },
+          "被告B": {
+            "行为": "",
+            "后果": "",
+            "犯罪事实": ""
+          }
+        }
+    """
+
+    # 替换案例文本
+    prompt = instruction.replace("{case_text}", case).replace("{number}", str(len(crime_info)))
+
+    try:
+        # 使用异步客户端
+        response = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        response_text = response.choices[0].message.content
+        elements_content = json_repair.loads(response_text)
+        # print(elements_content)
+        json_data = {
+            "elements": elements_content,
+            "crime_info": crime_info,
+            "relation": relation,
+            "id": id
+        }
+        return json_data
+    except Exception as e:
+        print(f"Error processing case {id}: {e}")
+        return None
+
+
+def save_json_data(json_data, file_path='<LOCAL_PATH>/test_element.jsonl'):
+    with open(file_path, "a", encoding="utf-8") as f:
+        json.dump(json_data, f, ensure_ascii=False)
+        f.write('\n')
+
+
+def get_processed_ids(file_path='<LOCAL_PATH>/test_element.jsonl'):
+    processed_ids = set()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    processed_ids.add(data["id"])
+                except:
+                    continue
+    except FileNotFoundError:
+        pass
+    return processed_ids
+
+
+def save_batch_results(batch_results, file_path='<LOCAL_PATH>/test_element.jsonl'):
+    """保存一批结果到文件"""
+    with open(file_path, "a", encoding="utf-8") as f:
+        for result in batch_results:
+            if result is not None:  # 只保存成功的请求结果
+                json.dump(result, f, ensure_ascii=False)
+                f.write('\n')
+
+
+# 异步函数包装同步的请求
+async def async_deepseek_query(case, id, relation, crime_info):
+    # 直接调用异步函数，无需run_in_executor
+    return await deepseek_query(case, id, relation, crime_info)
+
+
+# 主异步函数
+async def main():
+    processed_ids = get_processed_ids()
+
+    # 预加载所有未处理的数据
+    unprocessed_data = []
+    with open('<LOCAL_PATH>/data_test.jsonl', "r", encoding="utf-8") as f:
+        for line in f:
+            data = json.loads(line)
+            if data["id"] not in processed_ids:
+                unprocessed_data.append(data)
+
+    total_lines = len(unprocessed_data)
+    batch_size = 50  # 增加批处理大小
+    batch_count = 0
+    batch_save_interval = 10  # 每10个batch保存一次
+
+    results_buffer = []  # 缓存结果用于批量保存
+
+    pbar = tqdm(total=total_lines, desc="法律元素抽取中", miniters=100)
+
+    # 分批处理数据
+    for i in range(0, len(unprocessed_data), batch_size):
+        batch_data = unprocessed_data[i:i + batch_size]
+        tasks = []
+
+        # 为当前批次创建任务
+        for data in batch_data:
+            case = data["fact"]
+            relation = data['relations']
+            crime_info = data['criminals_info']
+            id = data['id']
+
+            tasks.append(async_deepseek_query(case, id, relation, crime_info))
+
+        # 并行执行当前批次的所有任务
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 处理结果
+        for result in results:
+            if not isinstance(result, Exception) and result is not None:
+                results_buffer.append(result)
+
+        pbar.update(len(batch_data))
+        batch_count += 1
+
+        # 每batch_save_interval个batch保存一次结果
+        if batch_count % batch_save_interval == 0 and results_buffer:
+            save_batch_results(results_buffer)
+            results_buffer.clear()
+            print(f"已保存 {batch_count} 个batch的结果")
+
+    # 保存剩余的结果
+    if results_buffer:
+        save_batch_results(results_buffer)
+        print(f"已保存最后 {len(results_buffer)} 个结果")
+
+    pbar.close()
+
+
+# 运行异步事件循环
+if __name__ == '__main__':
+    # 使用异步客户端
+    client = AsyncOpenAI(api_key="<API_KEY_REMOVED>", #Your Key
+                         base_url="https://api.deepseek.com")
+    asyncio.run(main())

@@ -1,0 +1,18 @@
+{
+  "source": "Supplied CoRe(V0.9).tex main-result tables",
+  "status": "reported_in_manuscript_not_rerun",
+  "model": "CoRe",
+  "scale": "percent",
+  "datasets": {
+    "CAIL-Small": {
+      "charge": {"accuracy": 88.51, "macro_precision": 89.41, "macro_recall": 86.47, "macro_f1": 87.29},
+      "law_article": {"accuracy": 88.22, "macro_precision": 85.43, "macro_recall": 80.73, "macro_f1": 82.37},
+      "term_of_penalty": {"accuracy": 43.20, "macro_precision": 43.31, "macro_recall": 36.80, "macro_f1": 38.20}
+    },
+    "MultiLJP": {
+      "charge": {"accuracy": 90.70, "macro_precision": 85.45, "macro_recall": 86.14, "macro_f1": 85.45},
+      "law_article": {"accuracy": 94.09, "macro_precision": 77.69, "macro_recall": 80.02, "macro_f1": 77.86},
+      "term_of_penalty": {"accuracy": 38.23, "macro_precision": 40.25, "macro_recall": 33.05, "macro_f1": 36.30}
+    }
+  }
+}

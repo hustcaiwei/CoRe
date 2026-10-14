@@ -1,0 +1,462 @@
+import json
+import re
+from typing import List, Dict, Tuple, Optional
+import faiss
+import numpy as np
+from tqdm import tqdm
+from openai import OpenAI
+import logging
+import asyncio
+import sys
+import json_repair
+
+
+def term_to_range(term_code):
+    """
+    将离散的刑期编码映射回对应的刑期区间描述
+
+    Args:
+        term_code (int): 离散的刑期编码 (0-10)
+
+    Returns:
+        str: 对应的刑期区间描述
+    """
+    term_ranges = {
+        0: "死刑",
+        1: "大于10年（>120个月）",
+        2: "7年到10年（84-120个月]",
+        3: "5年到7年（60-84个月]",
+        4: "3年到5年（36-60个月]",
+        5: "2年到3年（24-36个月]",
+        6: "1年到2年（12-24个月]",
+        7: "9个月到1年（9-12个月]",
+        8: "6个月到9个月（6-9个月]",
+        9: "0到6个月（0-6个月]",
+        10: "0个月"
+    }
+
+    return term_ranges.get(term_code, "未知编码")
+
+
+def extract_labels(entry):
+    accusation = entry['origin_data']['accu'][0]  # 罪名
+    relevant_article = entry['origin_data']['law'][0]  # 法条
+    term = entry['origin_data']['term']
+    death_penalty = entry['origin_data']['meta']['term_of_imprisonment']['death_penalty']
+    life_imprisonment = entry['origin_data']['meta']['term_of_imprisonment']['life_imprisonment']
+    if death_penalty:
+        imprisonment = "-1"
+    elif life_imprisonment:
+        imprisonment = "360"
+    else:
+        imprisonment = term
+    return relevant_article, accusation, processTerm(imprisonment)
+
+
+def processTerm(term):
+    if term == '-1':
+        return 0
+    elif term > 10 * 12:
+        return 1
+    elif term > 7 * 12:
+        return 2
+    elif term > 5 * 12:
+        return 3
+    elif term > 3 * 12:
+        return 4
+    elif term > 2 * 12:
+        return 5
+    elif term > 1 * 12:
+        return 6
+    elif term > 9:
+        return 7
+    elif term > 6:
+        return 8
+    elif term > 0:
+        return 9
+    else:
+        return 10
+
+
+def parse_output(model_output: str) -> Optional[Tuple[int, str, int]]:
+    """
+    解析模型输出
+    :param model_output: 模型返回的文本
+    :return: (法条, 罪名) 或 刑期月数
+    """
+    try:
+        parts = [p.strip() for p in model_output.strip().split('|')]
+        if len(parts) != 3:
+            raise ValueError("格式错误，应为 '法条|罪名|刑期'")
+        return eval(parts[0]), parts[1], eval(parts[2])
+    except Exception as e:
+        logging.error(f"解析失败: {str(e)} | 原始输出: {model_output}")
+        return None
+
+
+class PromptGenerator:
+    @staticmethod
+    def format_case(case: Dict) -> str:
+        """将单个案例转换为自然语言描述"""
+        return (
+            f"相似案例参考：\n"
+            f"- 案件事实：{case['case']}\n"
+            f"- 判决结果：{case['result']}"
+        )
+
+    @classmethod
+    def build_prompt(
+            cls,
+            test_case: Dict,
+            pred_law: int,
+            pred_accu: str,
+            judge_a_term: int,
+            similar_cases: List[Dict]
+    ) -> str:
+        """构建大模型提示模板"""
+        if pred_accu == '盗窃':
+            base_prompt = (
+                "你是一名专业法官B，请根据《中华人民共和国刑法》及发生所在地点发生年份的《量刑实施细则》对犯罪案件做出预测。\n"
+            )
+            if similar_cases:
+                references = "\n\n".join([cls.format_case(c) for c in similar_cases])
+                base_prompt += f"\n参考案例：\n{references}\n"
+            prompt = (
+                f"{base_prompt}\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['case']}\n"
+                f"法官A预测的法条：{pred_law}\n"
+                f"法官A预测的罪名：{pred_accu}\n"
+                f"法官A预测的刑期：{term_to_range(judge_a_term)}\n"
+                "要求：\n"
+                '''
+                1. 核对罪名和法条：
+                - 请结合当前案件事实的描述，分析法官A预测的罪名和法条是否符合实际情况。
+                - 相似案例相关性是从高往低排列的，注意低位次的相似案例与当前案件事实的相关性，若在动机、方式上存在显著差异，则推翻法官A的判决结果
+
+                2. 判断法官A预测的刑期是否合理：
+                - 请根据犯罪案例（考虑相似案例及其标签)，结合犯罪行为，犯罪后果及第一层面量刑情节和和第二层面量刑情节，评估法官A的刑期预测是否合理。
+
+                - 刑期区间的评估应严格对应以下范围：
+                - 0: "死刑"
+                - 1: "大于10年（>120个月）"
+                - 2: "7年到10年（84-120个月]"
+                - 3: "5年到7年（60-84个月]"
+                - 4: "3年到5年（36-60个月]"
+                - 5: "2年到3年（24-36个月]"
+                - 6: "1年到2年（12-24个月]"
+                - 7: "9个月到1年（9-12个月]"
+                - 8: "6个月到9个月（6-9个月]"
+                - 9: "0到6个月（0-6个月]"
+                - 10: "0个月"
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害",
+                "法条"：234,
+                "刑期"：9
+                }
+
+                注意：
+                -刑期预测评估要严格对应犯罪案例文本中存在的从轻/从重环节，不要推断和猜测。
+                -具体的刑期区间要根据第一层面量刑情节和第二层面量刑情节得到。
+                -你有权利直接推翻法官A的判决结果
+                '''
+            )
+            return prompt
+        else:
+            base_prompt = (
+                "你是一名专业法官B，请根据《中华人民共和国刑法》及发生所在年份的《量刑实施细则》对犯罪案件做出预测。\n"
+            )
+            if similar_cases:
+                references = "\n\n".join([cls.format_case(c) for c in similar_cases])
+                base_prompt += f"\n参考案例：\n{references}\n"
+            prompt = (
+                f"{base_prompt}\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['case']}\n"
+                f"法官A预测的法条：{pred_law}\n"
+                f"法官A预测的罪名：{pred_accu}\n"
+                f"法官A预测的刑期：{term_to_range(judge_a_term)}\n"
+                "要求：\n"
+                '''
+                1. 核对罪名和法条：
+                - 请结合当前案件事实的描述，分析法官A预测的罪名和法条是否符合实际情况。
+                - 相似案例相关性是从高往低排列的，注意低位次的相似案例与当前案件事实的相关性，若在动机、方式上存在显著差异，则推翻法官A的判决结果
+
+                2. 判断法官A预测的刑期是否合理：
+                - 请根据犯罪案例（考虑相似案例及其标签)，结合犯罪行为，犯罪后果及第一层面量刑情节和和第二层面量刑情节，评估法官A的刑期预测是否合理。
+
+                - 刑期区间的评估应严格对应以下范围：
+                - 0: "死刑"
+                - 1: "大于10年（>120个月）"
+                - 2: "7年到10年（84-120个月]"
+                - 3: "5年到7年（60-84个月]"
+                - 4: "3年到5年（36-60个月]"
+                - 5: "2年到3年（24-36个月]"
+                - 6: "1年到2年（12-24个月]"
+                - 7: "9个月到1年（9-12个月]"
+                - 8: "6个月到9个月（6-9个月]"
+                - 9: "0到6个月（0-6个月]"
+                - 10: "0个月"
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害",
+                "法条"：234,
+                "刑期"：9
+                }
+
+                注意：
+                -刑期预测评估要严格对应犯罪案例文本中存在的从轻/从重环节，不要推断和猜测。
+                -具体的刑期区间要根据第一层面量刑情节和第二层面量刑情节得到。
+                -你有权利直接推翻法官A的判决结果
+                '''
+            )
+            return prompt
+
+
+async def get_logger(filename, verbosity=1, name=None):
+    import os
+
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    # 检查日志文件是否已存在
+    if os.path.exists(filename):
+        print(f"日志文件 {filename} 已存在，跳过创建以避免覆盖")
+        sys.exit(1)
+    else:
+        # 文件不存在时创建新的 FileHandler
+        print(f"正在创建日志文件 {filename}...")
+        fh = logging.FileHandler(filename, "w")
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    # 始终添加 StreamHandler
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
+# 异步处理每个检索结果的函数
+async def process_behavior_results(I_behavior, D_behavior, scores_dict):
+    """
+    使用RRF算法处理行为检索结果，基于D_behavior分数进行排序
+    """
+    indexed_scores = [(i, D_behavior[0][i]) for i in range(len(D_behavior[0]))]
+    indexed_scores.sort(key=lambda x: x[1])
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_behavior[0][i]
+        behavior_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + behavior_score
+            scores_dict[case_id] = (behavior_score, c, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (behavior_score, 0, 0, behavior_score)
+
+
+async def process_consequence_results(I_consequence, D_consequence, scores_dict):
+    indexed_scores = [(i, D_consequence[0][i]) for i in range(len(D_consequence[0]))]
+    indexed_scores.sort(key=lambda x: x[1])
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_consequence[0][i]
+        consequence_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + consequence_score
+            scores_dict[case_id] = (b, consequence_score, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (0, consequence_score, 0, consequence_score)
+
+
+async def process_case_results(I_case, D_case, scores_dict):
+    """
+    使用RRF算法处理案例检索结果，基于D_case分数进行排序
+    """
+    indexed_scores = [(i, D_case[0][i]) for i in range(len(D_case[0]))]
+    indexed_scores.sort(key=lambda x: x[1])  # 按分数升序排序
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_case[0][i]
+        case_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + case_score
+            scores_dict[case_id] = (b, c, case_score, new_weighted)
+        else:
+            scores_dict[case_id] = (0, 0, case_score, case_score)
+
+async def process_case(test_case, client, cases, targets, indices):
+    try:
+        emb_case = []
+        emb_behavior = []
+        emb_consequence = []
+
+        emb_case.append(np.array(test_case['combined'], dtype=np.float32))
+        emb_behavior.append(np.array(test_case['behavior'], dtype=np.float32))
+        emb_consequence.append(np.array(test_case['consequence'][0], dtype=np.float32))
+
+        topK = 50
+        D_behavior, I_behavior = indices["behavior"].search(np.array(emb_behavior, dtype=np.float32), topK * 100)
+        D_case, I_case = indices["combined"].search(np.array(emb_case, dtype=np.float32), topK * 100)
+        D_consequence, I_consequence = indices["consequence"].search(np.array(emb_consequence, dtype=np.float32),
+                                                                     topK * 100)
+
+        scores_dict = {}
+        similar_cases = []
+
+        await asyncio.gather(
+            process_behavior_results(I_behavior, D_behavior, scores_dict),
+            process_consequence_results(I_consequence, D_consequence, scores_dict),
+            process_case_results(I_case, D_case, scores_dict)
+        )
+
+        filtered_scores_dict = {}
+
+        test_case_id = test_case['origin_data']['id']
+        judge_a_law = judge_a_predictions[test_case_id]['id']
+        judge_a_accu = judge_a_predictions[test_case_id]['crime']
+        judge_a_term = judge_a_predictions[test_case_id]['term']
+        for case_id, scores in scores_dict.items():
+            try:
+                target_info = targets[case_id]
+                if isinstance(target_info, str) and '罪名：' in target_info and '法条：' in target_info:
+                    # 使用正则表达式提取信息
+                    accu_match = re.search(r'罪名：([^；]+)', target_info)
+                    law_match = re.search(r'法条：(\d+)', target_info)
+
+                    if accu_match and law_match:
+                        target_accu = accu_match.group(1).strip()
+                        target_law = int(law_match.group(1))
+
+                        # 检查是否与法官A的预测匹配
+                        if target_law == judge_a_law and target_accu == judge_a_accu:
+                            filtered_scores_dict[case_id] = scores
+            except Exception as e:
+                continue
+
+        # 获取相似度最高的topK条数据
+        # 获取相似度最高的5条数据（从过滤后的结果中选取）
+        final_topK = min(topK, 19, len(filtered_scores_dict))
+        # 获取相似案例
+        sorted_results = sorted(
+            [(case_id, scores[0], scores[1], scores[2], scores[3]) for case_id, scores in filtered_scores_dict.items()],
+            key=lambda x: x[4], reverse=True)[:final_topK]
+
+        for case_id, b_score, c_score, ca_score, weighted_score in sorted_results:
+            result_dict = {
+                "case": cases[case_id],
+                "result": targets[case_id]
+            }
+            similar_cases.append(result_dict)
+
+        prompt = PromptGenerator.build_prompt(
+            test_case, judge_a_law, judge_a_accu, judge_a_term, similar_cases
+        )
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="deepseek-v3",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+
+        response_content = response.choices[0].message.content
+        judge_b = json_repair.loads(response_content)
+        prediction = (int(judge_b.get('法条')), judge_b.get('罪名'), int(judge_b.get('刑期')))
+        # 输出 DeepSeek 的响应结果
+        logger.info(f"id:{test_case['origin_data']['id']}")
+        truth = extract_labels(test_case)
+        logger.info(f"预测: {prediction} | 真实: {truth}")
+
+    except Exception as e:
+        print(f"Error processing case: {e}")
+
+async def process_test_cases():
+    # 读取文件和初始化
+
+    tasks = []
+    batch_size = 50
+
+    with open('<LOCAL_PATH>/unprocessed_data.json', 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc="处理测试案例", miniters=100):
+            test_case = json.loads(line)
+            tasks.append(
+                process_case(test_case, client, cases, targets, indices))
+
+            if len(tasks) == batch_size:
+                await asyncio.gather(*tasks)
+                tasks.clear()
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    accu_file_path = '<LOCAL_PATH>/new_accu.txt'
+    law_file_path = '<LOCAL_PATH>/new_law.txt'
+
+    accu_content = []
+    law_content = []
+    with open(accu_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            accu_content.append(line)
+    print("读取罪名txt完毕")
+
+    with open(law_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            law_content.append(line)
+    print("读取法条txt完毕")
+
+    logger = asyncio.run(get_logger(f'<LOCAL_PATH>/###.log'))
+    client = OpenAI(api_key="<API_KEY_REMOVED>", # Your Key
+                    base_url="https://api.chatanywhere.tech")
+    index_names = ["combined", "behavior", "consequence"]
+    indices = {}
+    cases, targets = [], []
+    results, labels = [], []
+    for name in index_names:
+        indices[name] = faiss.read_index('<LOCAL_PATH>/Index' + f"{name}.index")
+        print(f"{name} 索引加载完成")
+
+    with open("elementRAG.jsonl", "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="处理检索案例"):
+            case = json.loads(line)
+            cases.append(case["case"])
+            targets.append(case['target'])
+
+    judge_a_predictions = {}
+    log_file_path = '<LOCAL_PATH>/JudgeA.jsonl'
+    with open(log_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            data = json.loads(line)
+            test_case_id = data["test_case_id"]
+            judge_a_pred = data["judge_a_prediction"]
+            judge_a_predictions[test_case_id] = judge_a_pred
+    print("法官a加载完成")
+    # 假设已加载cases和targets
+    asyncio.run(process_test_cases())

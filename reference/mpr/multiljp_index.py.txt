@@ -1,0 +1,131 @@
+import time
+import json
+import faiss
+import numpy as np
+from tqdm import tqdm
+import asyncio
+import os  # 添加这个导入
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+embeddingModel = OpenAI(api_key="<API_KEY_REMOVED>", # Your key
+                        base_url="https://api.chatanywhere.tech")
+
+# 确保index目录存在
+index_dir = "index"
+os.makedirs(index_dir, exist_ok=True)
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def get_embedding_with_retry(text: str, max_retries=3) -> np.ndarray:
+    """带重试机制的OpenAI嵌入获取（异步）"""
+    if text.strip() == "":
+        return np.zeros(1536, dtype=np.float32)
+
+    for attempt in range(max_retries):
+        try:
+            response = embeddingModel.embeddings.create(
+                input=text,
+                model="text-embedding-ada-002"
+            )
+            return np.array(response.data[0].embedding, dtype=np.float32)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"API错误：{str(e)}，{wait}秒后重试...")
+                time.sleep(wait)
+            else:
+                print(f"API失败：{text[:50]}...")
+                return np.zeros(1536, dtype=np.float32)
+    return np.zeros(1536, dtype=np.float32)
+
+
+async def generate_embedding(loop, case, elements) -> dict:
+    """生成各要素向量（异步）"""
+    vectors = {}
+    # 并行请求所有嵌入
+    vectors["fact"] = await loop.run_in_executor(None, get_embedding_with_retry, case)
+
+    for elem in elements:
+        vectors[elem] = await loop.run_in_executor(None, get_embedding_with_retry, elements[elem])
+
+    return vectors
+
+
+async def index_embeddings():
+    dimension = 1536
+    indices = {
+        "fact": faiss.IndexFlatL2(dimension),
+        "behavior": faiss.IndexFlatL2(dimension),
+        "consequence": faiss.IndexFlatL2(dimension),
+    }
+
+    data = {
+        "fact": [],
+        "behavior": [],
+        "consequence": [],
+
+    }
+
+    loop = asyncio.get_event_loop()
+    path = '<LOCAL_PATH>/train_data_element.jsonl'
+    batch_size = 50
+    batch_count = 0
+    tasks = []
+    batch_start_time = time.time()
+    total_lines = sum(1 for line in open(path, "r", encoding="utf-8"))
+    # 文件路径为提取好法律元素的json文件
+    with open(path, "r", encoding="utf-8") as f:
+        for line in tqdm(f, total=total_lines, desc="向量化检索案例", miniters=100):
+            dic = json.loads(line)
+            case = dic['data']['elements']["犯罪事实"]
+            # 修改元素映射与第一个代码保持一致
+            elements = {
+                "behavior": dic['data']['elements']["行为"],
+                "consequence": dic['data']['elements']["后果"],
+            }
+
+            tasks.append(generate_embedding(loop, case, elements))
+
+            if len(tasks) >= batch_size:
+                results = await asyncio.gather(*tasks)
+                tasks.clear()
+                for vectors in results:
+                    data['fact'].append(vectors["fact"])
+                    data["behavior"].append(vectors["behavior"])
+                    data["consequence"].append(vectors["consequence"])
+
+                batch_end_time = time.time()
+                batch_duration = batch_end_time - batch_start_time
+                print(f"Batch {batch_count + 1} processed in {batch_duration:.2f} seconds")
+                batch_start_time = time.time()
+                batch_count += 1
+
+        # 等待所有任务完成
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for vectors in results:
+                data['fact'].append(vectors["fact"])
+                data["behavior"].append(vectors["behavior"])
+                data["consequence"].append(vectors["consequence"])
+
+            batch_end_time = time.time()
+            batch_duration = batch_end_time - batch_start_time
+            print(f"Batch {batch_count + 1} processed in {batch_duration:.2f} seconds")
+
+    print("\n=== 开始构建索引 ===")
+    # 修改索引构建部分与第一个代码保持一致
+    indices["fact"].add(np.array(data["fact"], dtype=np.float32))
+    indices["behavior"].add(np.array(data["behavior"], dtype=np.float32))
+    indices["consequence"].add(np.array(data["consequence"], dtype=np.float32))
+
+    for index_name in indices:
+        print(f"构建 {index_name} 索引...")
+        index = indices[index_name]
+
+        # 保存索引
+        faiss.write_index(index, f"{index_dir}/{index_name}.index")
+        print(f"  {index_name} 索引构建完成，数据量：{index.ntotal}")
+
+
+if __name__ == '__main__':
+    asyncio.run(index_embeddings())

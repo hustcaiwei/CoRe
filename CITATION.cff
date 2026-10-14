@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use CoRe, please cite the associated paper."
+title: "CoRe: Collaborative Reasoning with Reranked Multi-facet Retrieval for Legal Judgment Prediction"
+type: software
+version: 0.1.0
+authors:
+  - family-names: Cai
+    given-names: Wei
+  - family-names: Mei
+    given-names: Zihan
+  - family-names: Huang
+    given-names: Haojun
+  - family-names: Wang
+    given-names: Bang
+preferred-citation:
+  type: conference-paper
+  title: "Collaborative Reasoning with Reranked Multi-facet Retrieval for Legal Judgment Prediction"
+  year: 2026
+  authors:
+    - family-names: Cai
+      given-names: Wei
+    - family-names: Mei
+      given-names: Zihan
+    - family-names: Huang
+      given-names: Haojun
+    - family-names: Wang
+      given-names: Bang

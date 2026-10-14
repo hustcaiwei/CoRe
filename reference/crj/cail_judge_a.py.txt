@@ -1,0 +1,405 @@
+# import datetime
+# import time
+#
+# # 设置目标时间
+# target_time = datetime.datetime(2025, 9, 3, 0, 31)
+#
+# # 获取当前时间
+# current_time = datetime.datetime.now()
+#
+# # 如果当前时间早于目标时间，则等待
+# if current_time < target_time:
+#     wait_seconds = (target_time - current_time).total_seconds()
+#     print(f"等待 {wait_seconds} 秒到 {target_time} 再执行...")
+#     time.sleep(wait_seconds)
+
+
+import json
+import sys
+from typing import List, Dict, Tuple, Optional
+import faiss
+import numpy as np
+from tqdm import tqdm
+from openai import OpenAI
+import logging
+import asyncio
+import json_repair
+import os
+
+def extract_labels(entry):
+    accusation = entry['origin_data']['accu'][0]  # 罪名
+    relevant_article = entry['origin_data']['law'][0]  # 法条
+    term = entry['origin_data']['term']
+    death_penalty = entry['origin_data']['meta']['term_of_imprisonment']['death_penalty']
+    life_imprisonment = entry['origin_data']['meta']['term_of_imprisonment']['life_imprisonment']
+
+    if death_penalty:
+        imprisonment = "-1"
+    elif life_imprisonment:
+        imprisonment = "360"
+    else:
+        imprisonment = term
+    return relevant_article, accusation, processTerm(int(imprisonment))
+
+
+def processTerm(term):
+    if term == '-1':
+        return 0
+    elif term > 10 * 12:
+        return 1
+    elif term > 7 * 12:
+        return 2
+    elif term > 5 * 12:
+        return 3
+    elif term > 3 * 12:
+        return 4
+    elif term > 2 * 12:
+        return 5
+    elif term > 1 * 12:
+        return 6
+    elif term > 9:
+        return 7
+    elif term > 6:
+        return 8
+    elif term > 0:
+        return 9
+    else:
+        return 10
+
+
+def parse_output(model_output: str) -> Optional[Tuple[int, str, int]]:
+    """
+    解析模型输出
+    :param model_output: 模型返回的文本
+    :return: (法条, 罪名) 或 刑期月数
+    """
+    try:
+        parts = [p.strip() for p in model_output.strip().split('|')]
+        if len(parts) != 3:
+            raise ValueError("格式错误，应为 '法条|罪名|刑期'")
+        return eval(parts[0]), parts[1], eval(parts[2])
+    except Exception as e:
+        logging.error(f"解析失败: {str(e)} | 原始输出: {model_output}")
+        return None
+
+
+class PromptGenerator:
+    @staticmethod
+    def format_case(case: Dict) -> str:
+        """将单个案例转换为自然语言描述"""
+        return (
+            f"相似案例参考：\n"
+            f"- 案件事实：{case['case']}\n"
+            f"- 判决结果：{case['result']}"
+        )
+
+    # 在PromptGenerator类中添加一个新的方法用于消融实验
+    @classmethod
+    def build_prompt_ablation(
+            cls,
+            test_case: Dict,
+    ) -> str:
+        """构建大模型提示模板（消融实验版本，不使用相似案例）"""
+        prompt = (
+            "你是一名专业刑事法官，请根据《中华人民共和国刑法》对以下案件做出判决。\n"
+            "罪名库：\n"
+            f"{accu_content}\n"
+            "当前案件事实：\n"
+            f"{test_case['origin_data']['case']}\n"
+            "要求：\n"
+            '''
+            "1. 仅考虑法条、罪名和刑期三个要素"
+            "2. 输出格式严格遵循：法条数字|罪名|刑期月数"
+            "3. 每个案件只输出一个最可能的判决结果"
+            "4. 罪名中不要带罪字，比如直接输出盗窃而不是盗窃罪"
+            "5. 注意区分 故意伤害 和 寻衅滋事"
+
+            最终输出规则：
+            仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+            按照**JSON**格式输出，示例：
+            {
+            "罪名"："故意伤害",
+            "法条"：234,
+            "刑期"：24
+            }
+            '''
+        )
+        return prompt
+
+    @classmethod
+    def build_prompt(
+            cls,
+            test_case: Dict,
+            similar_cases: List[Dict],
+    ) -> str:
+        """构建大模型提示模板"""
+        base_prompt = (
+            "你是一名专业刑事法官，请根据《中华人民共和国刑法》对以下案件做出判决。\n"
+            "罪名库：\n"
+            f"{accu_content}\n"
+        )
+
+        if similar_cases:
+            references = "\n\n".join([cls.format_case(c) for c in similar_cases])
+            prompt = (
+                f"{base_prompt}{references}\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['case']}\n"
+                "要求：\n"
+                '''
+                "1. 仅考虑法条、罪名和刑期三个要素\n"
+                "2. 输出格式严格遵循：法条数字|罪名|刑期月数\n"
+                "3. 每个案件只输出一个最可能的判决结果\n"
+                "4. 罪名中不要带罪字，比如直接输出盗窃而不是盗窃罪\n"
+                "5. 输出示例：'234|故意伤害|144'\n"
+                "6. 注意区分 故意伤害 和 寻衅滋事"
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害",
+                "法条"：234,
+                "刑期"：24
+                }
+                '''
+            )
+        else:
+            prompt = (
+                f"{base_prompt}当前案件事实：\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['case']}\n"
+                "要求：\n"
+                '''
+                "1. 仅考虑法条、罪名和刑期三个要素"
+                "2. 输出格式严格遵循：法条数字|罪名|刑期月数"
+                "3. 每个案件只输出一个最可能的判决结果"
+                "4. 罪名中不要带罪字，比如直接输出盗窃而不是盗窃罪"
+                "5. 注意区分 故意伤害 和 寻衅滋事"
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害",
+                "法条"：234,
+                "刑期"：24
+                }
+                '''
+            )
+        return prompt
+
+async def get_logger(filename, verbosity=1, name=None):
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    # 检查日志文件是否已存在
+    if os.path.exists(filename):
+        print(f"日志文件 {filename} 已存在，跳过创建以避免覆盖")
+        sys.exit(1)
+    else:
+        # 文件不存在时创建新的 FileHandler
+        print(f"正在创建日志文件 {filename}...")
+        fh = logging.FileHandler(filename, "w")
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    # 始终添加 StreamHandler
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
+
+# 异步处理每个检索结果的函数
+async def process_behavior_results(I_behavior, D_behavior, scores_dict):
+    """
+    使用RRF算法处理行为检索结果，基于D_behavior分数进行排序
+    """
+    indexed_scores = [(i, D_behavior[0][i]) for i in range(len(D_behavior[0]))]
+    indexed_scores.sort(key=lambda x: x[1])
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_behavior[0][i]
+        behavior_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + behavior_score
+            scores_dict[case_id] = (behavior_score, c, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (behavior_score, 0, 0, behavior_score)
+
+
+# 处理后果的异步函数
+async def process_consequence_results(I_consequence, D_consequence, scores_dict):
+    indexed_scores = [(i, D_consequence[0][i]) for i in range(len(D_consequence[0]))]
+    indexed_scores.sort(key=lambda x: x[1])
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_consequence[0][i]
+        consequence_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + consequence_score
+            scores_dict[case_id] = (b, consequence_score, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (0, consequence_score, 0, consequence_score)
+
+
+# 处理案例本身的异步函数
+async def process_case_results(I_case, D_case, scores_dict):
+    """
+    使用RRF算法处理案例检索结果，基于D_case分数进行排序
+    """
+
+    indexed_scores = [(i, D_case[0][i]) for i in range(len(D_case[0]))]
+    indexed_scores.sort(key=lambda x: x[1])
+
+    k = 60
+
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_case[0][i]
+        case_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + case_score
+            scores_dict[case_id] = (b, c, case_score, new_weighted)
+        else:
+            scores_dict[case_id] = (0, 0, case_score, case_score)
+
+async def process_case(test_case, client, cases, targets, indices, results, labels):
+    try:
+        emb_case = []
+        emb_behavior = []
+        emb_consequence = []
+
+        emb_case.append(np.array(test_case['combined'], dtype=np.float32))
+        emb_behavior.append(np.array(test_case['behavior'], dtype=np.float32))
+        emb_consequence.append(np.array(test_case['consequence'][0], dtype=np.float32))
+
+        topK = 50
+        D_behavior, I_behavior = indices["behavior"].search(np.array(emb_behavior, dtype=np.float32), topK * 100)
+        D_case, I_case = indices["combined"].search(np.array(emb_case, dtype=np.float32), topK * 100)
+        D_consequence, I_consequence = indices["consequence"].search(np.array(emb_consequence, dtype=np.float32),
+                                                                     topK * 100)
+
+        scores_dict = {}
+        similar_cases = []
+
+        await asyncio.gather(
+            process_behavior_results(I_behavior, D_behavior, scores_dict),
+            process_consequence_results(I_consequence, D_consequence, scores_dict),
+            process_case_results(I_case, D_case, scores_dict)
+        )
+
+        final_topK = min(19, len(scores_dict))
+
+        # 获取相似案例
+        sorted_results = sorted(
+            [(case_id, scores[0], scores[1], scores[2], scores[3]) for case_id, scores in scores_dict.items()],
+            key=lambda x: x[4], reverse=True)[:final_topK]
+
+        for case_id, b_score, c_score, ca_score, weighted_score in sorted_results:
+            result_dict = {
+                "case": cases[case_id],
+                "result": targets[case_id],
+                "id": case_id
+            }
+            similar_cases.append(result_dict)
+
+        # 构建提示并发送OpenAI请求
+        prompt = PromptGenerator.build_prompt(test_case, similar_cases)
+        # prompt = PromptGenerator.build_prompt_ablation(test_case)
+
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="deepseek-v3",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            response_format={"type": "json_object"}
+        )
+
+        repsonse_text = response.choices[0].message.content
+        judge_a = json_repair.loads(repsonse_text)
+        if not judge_a:
+            raise ValueError("第一阶段解析失败")
+
+        prediction_a = (int(judge_a['法条']), judge_a['罪名'], processTerm(int(judge_a['刑期'])))
+        truth = extract_labels(test_case)
+        results.append(prediction_a)
+        labels.append(truth)
+
+        test_case_id = test_case['origin_data'].get('id', 'unknown')
+        logging.info(f"test_case_id: {test_case_id}")
+        similar_case_ids = [str(result["id"]) for result in similar_cases]
+        logging.info(f"similar_case_ids: {', '.join(similar_case_ids)}")
+        logging.info(f"法官a预测: {prediction_a} | 真实: {truth}")
+
+    except Exception as e:
+        print(f"Error processing case: {e}")
+
+async def process_test_cases():
+    tasks = []
+    batch_size = 30
+
+    with open('<LOCAL_PATH>/test_emb.json', 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc="处理测试案例", miniters=100):
+            test_case = json.loads(line)
+            tasks.append(process_case(test_case, client, cases, targets, indices, results, labels))
+
+            if len(tasks) == batch_size:
+                await asyncio.gather(*tasks)
+                tasks.clear()
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    accu_file_path = '<LOCAL_PATH>/new_accu.txt'
+    law_file_path = '<LOCAL_PATH>/new_law.txt'
+
+    accu_content = []
+    law_content = []
+    with open(accu_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            accu_content.append(line)
+    print("读取罪名txt完毕")
+    with open(law_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            law_content.append(line)
+    print("读取法条txt完毕")
+    logger = asyncio.run(get_logger(f'<LOCAL_PATH>/###.log'))
+    client = OpenAI(api_key="<API_KEY_REMOVED>", # Your Key
+                    base_url="https://api.chatanywhere.tech")
+    index_names = ["combined", "behavior", "consequence"]
+    indices = {}
+    cases, targets = [], []
+    results, labels = [], []
+    for name in index_names:
+        indices[name] = faiss.read_index('<LOCAL_PATH>/Index' + f"{name}.index")
+        print(f"{name} 索引加载完成")
+
+    with open("elementRAG.jsonl", "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="处理检索案例"):
+            case = json.loads(line)
+            cases.append(case["case"])
+            targets.append(case['target'])
+
+    # 假设已加载cases和targets
+    asyncio.run(process_test_cases())

@@ -1,0 +1,228 @@
+import json
+import asyncio
+import requests
+from tqdm import tqdm
+import time  # 引入时间模块来记录花费的时间
+
+from tenacity import retry, stop_after_attempt, wait_fixed, RetryError
+
+# 设置请求超时时间为 10 秒，超过此时间未响应则视为超时
+TIMEOUT = 50
+
+def get_processed_ids(file_path='<LOCAL_PATH>/test_summary.jsonl'):
+    processed_ids = set()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):  # Ensure the data is a dictionary
+                        processed_ids.add(data.get("id", None))  # Using .get() in case "id" doesn't exist
+                    else:
+                        print(f"Line is not a dictionary: {line}")
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding line in {file_path}: {e}")
+                    continue
+    except FileNotFoundError:
+        print(f"File not found: {file_path}")
+    return processed_ids
+
+def save_json_data(all_json_data, file_path='<LOCAL_PATH>/test_summary.jsonl'):
+    with open(file_path, "a", encoding="utf-8") as f:
+        for json_data in all_json_data:
+            json.dump(json_data, f, ensure_ascii=False)
+            f.write('\n')
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))  # 重试最多3次，每次间隔2秒
+def deepseek_query(case, id, accu, all_json_data):
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer <API_KEY_REMOVED>",  # API key
+        "Content-Type": "application/json"
+    }
+
+    prompt = """
+              "任务说明": "根据提供的刑事案例文本，精准识别最符合的一个罪名，并提取定罪依据、犯罪后果及量刑情节，输出结构化JSON数据",
+              "输入要求": {
+                "案例文本": "需分析的原始案例文本"
+              },
+              "处理规则": [
+                "1. **罪名确定**：",
+                "- 罪名确定根据犯罪主体、主观方面、客体和客观方面匹配唯一最吻合罪名",
+                "- 注意区分聚众斗殴（纠集多人）",
+                "- 注意区分寻衅滋事（随意/无故,发生在公共场所）",
+                "- 注意区分非法入侵住宅（造成财物损失没达到5000元）",
+                "- 注意区分过失致人死亡（疏忽大意的过失和过于自信的过失）",
+                "- 注意区分猥亵儿童（被害者未成年）"
+                "- 注意区分招摇撞骗（冒充国家机关工作人员）"
+                "- 注意区分强制猥亵跟强奸未遂"，
+                "- 必须完全符合《刑法》该罪名的构成要件",
+                "2. **定罪依据**：",
+                "- 提取该罪名成立的必要行为要素",
+                "- 删除所有地点、时间、当事人称谓等无关信息",
+                "- 使用'行为人+行为+手段+对象'的主动语态（如'行为人猥亵未成年'）",
+                "- 用1-2句话概括所有犯罪行为（如'多次盗窃商铺财物'）"
+                "3. **犯罪后果**：",
+                "- 物质损失：精确金额（如'损失5000元'）",
+                "- 人身伤害：采用《人体损伤程度鉴定标准》术语（如'轻伤二级'）",
+                "- 无后果则标注'无'",
+                "- 用一句话概括所有的犯罪后果（如'造成2万元损失及1人轻伤'）,不超过50个字"
+                "4. **量刑情节**：",
+                "- 第1层面：必须明确具体类型（如'犯罪未遂'而非'未遂'）",
+                "- 第2层面：多项情节用换行符（\\n）分隔",
+                "- 无则标注'无'"
+              ],
+              "输出规范": {
+                "示例": {
+                  "罪名": "故意伤害罪",
+                  "定罪依据": "行为人持刀砍击被害人左臂",
+                  "犯罪后果": "重伤二级",
+                  "第1层面量刑情节": "无",
+                  "第2层面量刑情节": "自首\\n赔偿损失"
+                }
+              },
+              "特殊指令": [
+                "1. 行为描述必须包含：",
+                "- 工具（如'持斧头'）",
+                "- 手段（如'撬锁'）",
+                "- 关键动作（如'刺入胸部'）",
+                "2. 必须删除：",
+                "- 所有修饰性词语（如'残忍地''恶意'）",
+                "- 判决过程信息（如'被当场抓获'）",
+                "3. 禁止推断：",
+                "- 不得添加文本中未明确描述的情节"
+        """
+
+
+    # 请求体
+    data_response = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": case}
+        ],
+        "temperature": 0.3,
+        "stream": False,
+        "response_format": {
+            "type": "json_object"
+        }
+    }
+
+    try:
+        # 发送请求并添加超时设置
+        response = requests.post(url, json=data_response, headers=headers, timeout=TIMEOUT)
+
+        if response.status_code == 200:
+            response_json = response.json()
+            elements_content = response_json['choices'][0]['message']['content']
+            # print(id)
+            # print(accu)
+            # print(elements_content)
+            json_str = elements_content.strip().removeprefix('```json').removesuffix('```').strip()
+            data_dict = json.loads(json_str)
+            json_data = {
+                "id": id,
+                "pred_accu": data_dict['罪名'],
+                "true_accu": accu,
+                "behavior": data_dict['定罪依据'],
+                "consequence": data_dict['犯罪后果'],
+                "first_level_violations": data_dict['第1层面量刑情节'],
+                "second_level_violations": data_dict['第2层面量刑情节']
+            }
+
+            all_json_data.append(json_data)
+            return json_data
+        else:
+            print(f"Failed request with status code: {response.status_code}")
+            return None
+    except requests.exceptions.Timeout as e:
+        print(f"Request timed out: {e}")
+        raise  # 触发重试
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
+        return None
+
+async def async_deepseek_query(case, id, accu, all_json_data):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, deepseek_query, case, id, accu, all_json_data)
+
+# 异步读取和处理文件
+async def main():
+    processed_ids = get_processed_ids()  # 获取已处理的 ID 列表
+    print(f"已读取 {len(processed_ids)} 个已处理的案例 ID")
+
+    all_json_data = []  # 用于保存所有返回的数据
+    path = '<LOCAL_PATH>/data_test_cs.json'
+    batch_size = 30  # 每批处理 10 个案例
+    batch_count = 0
+    total_lines = sum(1 for line in open(path, "r", encoding="utf-8"))  # 计算文件总行数
+    tasks = []  # 异步请求任务列表
+    batch_start_time = time.time()
+    task_count = 0  # 跟踪已处理的任务数
+
+    with open(path, "r", encoding="utf-8") as f:
+        pbar = tqdm(f, desc="犯罪案例总结中", total=total_lines)  # 进度条显示总行数
+        for i, line in enumerate(pbar):
+            data = json.loads(line)
+            if data["id"] in processed_ids:  # 跳过已处理的
+                continue
+            case = data["fact_cut"]
+            accu = accu_content[data['accu']]
+            term = data["term"]
+            id = data['id']
+
+            # 异步请求 DeepSeek API
+            tasks.append(async_deepseek_query(case, id, accu, all_json_data))
+            task_count += 1  # 增加任务数
+
+            if len(tasks) >= batch_size:  # 当任务数量达到批处理大小时，开始处理
+                results = await asyncio.gather(*tasks)  # 等待所有任务完成
+                tasks.clear()  # 清空任务列表
+
+                batch_end_time = time.time()
+                batch_duration = batch_end_time - batch_start_time
+                print(f"第 {batch_count + 1} 批处理完毕，总耗时 {batch_duration:.2f} 秒")
+                batch_start_time = time.time()  # 重新开始计时
+                batch_count += 1  # 增加批次计数
+
+            if task_count >= 5:  # 每处理 1000 个任务就保存一次
+                save_json_data(all_json_data)
+                all_json_data.clear()  # 清空数据列表
+                task_count = 0  # 重置任务数
+
+        if tasks:  # 处理剩余的任务
+            results = await asyncio.gather(*tasks)
+
+            batch_end_time = time.time()
+            batch_duration = batch_end_time - batch_start_time
+            print(f"第 {batch_count + 1} 批处理完毕，总耗时 {batch_duration:.2f} 秒")
+
+            # 保存剩余的数据
+        if all_json_data:
+            save_json_data(all_json_data)
+
+
+# 启动异步任务
+if __name__ == '__main__':
+
+    accu_file_path = '<LOCAL_PATH>/new_accu.txt'
+    law_file_path = '<LOCAL_PATH>/new_law.txt'
+
+    accu_content = []
+    law_content = []
+
+    # 读取罪名数据
+    with open(accu_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            accu_content.append(line)
+    print("读取罪名txt完毕")
+
+    # 读取法条数据
+    with open(law_file_path, 'r', encoding='gbk') as file:
+        for line in file:
+            line = line.strip()
+            law_content.append(line)
+    print("读取法条txt完毕")
+    asyncio.run(main())

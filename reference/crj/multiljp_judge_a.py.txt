@@ -1,0 +1,476 @@
+import json
+import sys
+from typing import List, Dict, Tuple, Optional
+import faiss
+import numpy as np
+from tqdm import tqdm
+from openai import OpenAI
+import logging
+import asyncio
+import json_repair
+import os
+import re
+
+def extract_labels(entry):
+    accusation = entry['origin_data']['data']['crime_info']['accusations'][0]  # 罪名
+    relevant_article = entry['origin_data']['data']['crime_info']['laws'][0]  # 法条
+    term_str = entry['origin_data']['data']['crime_info']['term']
+    term = convert_term_to_months(term_str)
+
+    return relevant_article, accusation, processTerm(int(term))
+
+
+def convert_term_to_months(term_str):
+    """
+    将刑期字符串转换为月数
+
+    参数:
+    term_str (str): 刑期字符串，例如"有期徒刑一年十个月"、"拘役三个月"、"无期徒刑"等
+
+    返回:
+    int: 对应的月数，特殊情况下：
+         - 死刑返回 0
+         - 无期徒刑返回 0（表示无期徒刑）
+    """
+    if not term_str or term_str.strip() == "":
+        return 0
+
+    # 处理特殊判决
+    if "死刑" in term_str:
+        return 0
+    elif "无期徒刑" in term_str:
+        return 0  # 用360表示无期徒刑
+
+    # 中文数字到阿拉伯数字的映射
+    chinese_num_map = {
+        '零': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+        '五': 5, '六': 6, '七': 7, '八': 8, '九': 9,
+        '十': 10, '十一': 11, '十二': 12, '两': 2, '廿': 20, '卅': 30
+    }
+
+    # 处理拘役情况
+    if "拘役" in term_str:
+        # 提取拘役的天数或月数
+        if "天" in term_str:
+            # 查找天数
+            day_match = re.search(r'拘役\s*([零一二三四五六七八九十两百千万]+|\d+)\s*天', term_str)
+            if day_match:
+                day_str = day_match.group(1)
+                # 判断是中文数字还是阿拉伯数字
+                if day_str.isdigit():
+                    days = int(day_str)
+                else:
+                    # 处理中文数字
+                    if day_str in chinese_num_map:
+                        days = chinese_num_map[day_str]
+                    elif day_str == '百':
+                        days = 100
+                    elif day_str == '千':
+                        days = 1000
+                    elif day_str == '万':
+                        days = 10000
+                    else:
+                        # 尝试解析复合中文数字，如"三十"
+                        if '十' in day_str:
+                            parts = day_str.split('十')
+                            if len(parts) == 1:  # 如"十"
+                                days = 10
+                            elif parts[0] == '':  # 如"十五"
+                                days = 10 + chinese_num_map.get(parts[1], 0)
+                            else:  # 如"二十五"
+                                days = chinese_num_map.get(parts[0], 0) * 10 + chinese_num_map.get(parts[1], 0)
+                        else:
+                            days = 30  # 默认值
+                return max(1, days // 30)  # 至少为1个月
+        elif "个月" in term_str or "月" in term_str:
+            # 查找月数
+            month_match = re.search(r'拘役\s*([零一二三四五六七八九十两]+|\d+)\s*[个月]', term_str)
+            if month_match:
+                month_str = month_match.group(1)
+                if month_str.isdigit():
+                    return int(month_str)
+                else:
+                    return chinese_num_map.get(month_str, 0)
+        else:
+            # 只有数字的拘役，通常是以月为单位
+            digits = ''.join(filter(str.isdigit, term_str))
+            if digits:
+                return int(digits)
+        return 0
+
+    # 提取年数和月数（适用于有期徒刑等）
+    years = 0
+    months = 0
+
+    # 查找年份
+    if "年" in term_str:
+        year_match = re.search(r'([零一二三四五六七八九十两百]+|\d+)\s*年', term_str)
+        if year_match:
+            year_str = year_match.group(1)
+            if year_str.isdigit():
+                years = int(year_str)
+            else:
+                # 处理中文数字年份
+                if year_str in chinese_num_map:
+                    years = chinese_num_map[year_str]
+                elif year_str == '百':
+                    years = 100
+                else:
+                    # 尝试解析复合中文数字，如"二十"
+                    if '十' in year_str:
+                        parts = year_str.split('十')
+                        if len(parts) == 1:  # 如"十"
+                            years = 10
+                        elif parts[0] == '':  # 如"十五"
+                            years = 10 + chinese_num_map.get(parts[1], 0)
+                        else:  # 如"二十五"
+                            years = chinese_num_map.get(parts[0], 0) * 10 + chinese_num_map.get(parts[1], 0)
+                    else:
+                        years = 0
+
+    # 查找月份
+    if "个月" in term_str or "月" in term_str:
+        month_match = re.search(r'([零一二三四五六七八九十两]+|\d+)\s*[个月]', term_str)
+        if month_match:
+            month_str = month_match.group(1)
+            if month_str.isdigit():
+                months = int(month_str)
+            else:
+                months = chinese_num_map.get(month_str, 0)
+
+    return years * 12 + months
+
+
+def processTerm(term):
+    if term > 20 * 12:
+        return 0
+    elif term > 10 * 12:
+        return 1
+    elif term > 7 * 12:
+        return 2
+    elif term > 5 * 12:
+        return 3
+    elif term > 3 * 12:
+        return 4
+    elif term > 2 * 12:
+        return 5
+    elif term > 1 * 12:
+        return 6
+    elif term > 9:
+        return 7
+    elif term > 6:
+        return 8
+    elif term > 0:
+        return 9
+    else:
+        return 10
+
+
+def parse_output(model_output: str) -> Optional[Tuple[int, str, int]]:
+    """
+    解析模型输出
+    :param model_output: 模型返回的文本
+    :return: (法条, 罪名) 或 刑期月数
+    """
+    try:
+        parts = [p.strip() for p in model_output.strip().split('|')]
+        if len(parts) != 3:
+            raise ValueError("格式错误，应为 '法条|罪名|刑期'")
+        return eval(parts[0]), parts[1], eval(parts[2])
+    except Exception as e:
+        logging.error(f"解析失败: {str(e)} | 原始输出: {model_output}")
+        return None
+
+
+class PromptGenerator:
+    @staticmethod
+    def format_case(case: Dict) -> str:
+        """将单个案例转换为自然语言描述"""
+        return (
+            f"相似案例参考：\n"
+            f"- 案件事实：{case['case']}\n"
+            f"- 判决结果：{case['result']}"
+        )
+
+    @classmethod
+    def build_prompt(
+            cls,
+            test_case: Dict,
+            similar_cases: List[Dict],
+    ) -> str:
+        """构建大模型提示模板"""
+        base_prompt = (
+            "你是一名专业刑事法官，请根据《中华人民共和国刑法》对以下案件做出判决。\n"
+            "罪名库：\n"
+            f"{accu_content}\n"
+        )
+
+        if similar_cases:
+            references = "\n\n".join([cls.format_case(c) for c in similar_cases])
+            prompt = (
+                f"{base_prompt}{references}\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['data']['elements']['犯罪事实']}\n"
+                "要求：\n"
+                '''
+                "1. 仅考虑法条、罪名和刑期三个要素\n"
+                "2. 输出格式严格遵循：法条数字|罪名|刑期月数\n"
+                "3. 每个案件只输出一个最可能的判决结果\n"
+                "5. 输出示例：'234|故意伤害罪|144'\n"
+                "6. 注意区分 故意伤害 和 寻衅滋事、 赌博罪 和 开设赌场罪"
+
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害罪",
+                "法条"：234,
+                "刑期"：24
+                }
+                '''
+            )
+        else:
+            prompt = (
+                f"{base_prompt}当前案件事实：\n"
+                "当前案件事实：\n"
+                f"{test_case['origin_data']['data']['elements']['犯罪事实']}\n"
+                "要求：\n"
+                '''
+                "1. 仅考虑法条、罪名和刑期三个要素"
+                "2. 输出格式严格遵循：法条数字|罪名|刑期月数"
+                "3. 每个案件只输出一个最可能的判决结果"
+                "4. 注意区分 故意伤害 和 寻衅滋事"
+
+                最终输出规则：
+                仅输出 法条|罪名|刑期，不得包含任何额外分析或解释。
+                如果无法确定，则输出相似度最高案例的判决结果。
+                按照**JSON**格式输出，示例：
+                {
+                "罪名"："故意伤害罪",
+                "法条"：234,
+                "刑期"：24
+                }
+                '''
+            )
+        return prompt
+
+async def get_logger(filename, verbosity=1, name=None):
+    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
+    formatter = logging.Formatter(
+        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
+    )
+    logger = logging.getLogger(name)
+    logger.setLevel(level_dict[verbosity])
+
+    # 检查日志文件是否已存在
+    if os.path.exists(filename):
+        print(f"日志文件 {filename} 已存在，跳过创建以避免覆盖")
+        sys.exit(1)
+    else:
+        # 文件不存在时创建新的 FileHandler
+        print(f"正在创建日志文件 {filename}...")
+        fh = logging.FileHandler(filename, "w")
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+    # 始终添加 StreamHandler
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
+
+# 异步处理每个检索结果的函数
+async def process_behavior_results(I_behavior, D_behavior, scores_dict):
+    """
+    使用RRF算法处理行为检索结果，基于D_behavior分数进行排序
+    """
+    # 创建(索引, 分数)对并按分数排序（分数越小表示越相似）
+    indexed_scores = [(i, D_behavior[0][i]) for i in range(len(D_behavior[0]))]
+    indexed_scores.sort(key=lambda x: x[1])  # 按分数升序排序
+
+    k = 60  # RRF平滑参数
+
+    # 根据排序后的顺序应用RRF算法
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_behavior[0][i]
+        # 使用RRF公式计算得分: 1 / (rank + k)
+        behavior_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + behavior_score  # 不再使用权重
+            scores_dict[case_id] = (behavior_score, c, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (behavior_score, 0, 0, behavior_score)
+
+
+# 处理后果的异步函数
+async def process_consequence_results(I_consequence, D_consequence, scores_dict):
+    indexed_scores = [(i, D_consequence[0][i]) for i in range(len(D_consequence[0]))]
+    indexed_scores.sort(key=lambda x: x[1])  # 按分数升序排序
+
+    k = 60  # RRF平滑参数
+
+    # 根据排序后的顺序应用RRF算法
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_consequence[0][i]
+        # 使用RRF公式计算得分: 1 / (rank + k)
+        consequence_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + consequence_score
+            scores_dict[case_id] = (b, consequence_score, ca, new_weighted)
+        else:
+            scores_dict[case_id] = (0, consequence_score, 0, consequence_score)
+
+
+# 处理案例本身的异步函数
+async def process_case_results(I_case, D_case, scores_dict):
+    """
+    使用RRF算法处理案例检索结果，基于D_case分数进行排序
+    """
+    # 创建(索引, 分数)对并按分数排序（分数越小表示越相似）
+    indexed_scores = [(i, D_case[0][i]) for i in range(len(D_case[0]))]
+    indexed_scores.sort(key=lambda x: x[1])  # 按分数升序排序
+
+    k = 60  # RRF平滑参数
+
+    # 根据排序后的顺序应用RRF算法
+    for rank, (i, distance) in enumerate(indexed_scores):
+        case_id = I_case[0][i]
+        # 使用RRF公式计算得分: 1 / (rank + k)
+        case_score = 1 / (rank + 1 + k)
+
+        if case_id in scores_dict:
+            b, c, ca, w = scores_dict[case_id]
+            new_weighted = w + case_score  # 不再使用权重
+            scores_dict[case_id] = (b, c, case_score, new_weighted)
+        else:
+            scores_dict[case_id] = (0, 0, case_score, case_score)
+
+async def process_case(test_case, client, cases, targets, indices, results, labels):
+    try:
+        emb_case = []
+        emb_behavior = []
+        emb_consequence = []
+
+        emb_case.append(np.array(test_case['fact_emb'], dtype=np.float32))
+        emb_behavior.append(np.array(test_case['behavior'], dtype=np.float32))
+        emb_consequence.append(np.array(test_case['consequence'], dtype=np.float32))
+
+        topK = 50
+        D_behavior, I_behavior = indices["behavior"].search(np.array(emb_behavior, dtype=np.float32), topK * 100)
+        D_case, I_case = indices["fact"].search(np.array(emb_case, dtype=np.float32), topK * 100)
+        D_consequence, I_consequence = indices["consequence"].search(np.array(emb_consequence, dtype=np.float32),
+                                                                     topK * 100)
+
+        scores_dict = {}
+        similar_cases = []
+
+        await asyncio.gather(
+            process_behavior_results(I_behavior, D_behavior, scores_dict),
+            process_consequence_results(I_consequence, D_consequence, scores_dict),
+            process_case_results(I_case, D_case, scores_dict)
+        )
+
+        final_topK = min(9, len(scores_dict))  # 只取最多5个案例
+
+        # 获取相似案例
+        sorted_results = sorted(
+            [(case_id, scores[0], scores[1], scores[2], scores[3]) for case_id, scores in scores_dict.items()],
+            key=lambda x: x[4], reverse=True)[:final_topK]
+
+        for case_id, b_score, c_score, ca_score, weighted_score in sorted_results:
+            result_dict = {
+                "case": cases[case_id],
+                "result": targets[case_id],
+                "id": case_id
+            }
+            similar_cases.append(result_dict)
+
+        # 构建提示并发送OpenAI请求
+        prompt = PromptGenerator.build_prompt(test_case, similar_cases)
+
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+
+        repsonse_text = response.choices[0].message.content
+        judge_a = json_repair.loads(repsonse_text)
+        if not judge_a:
+            raise ValueError("第一阶段解析失败")
+
+        prediction_a = (int(judge_a['法条']), judge_a['罪名'], processTerm(int(judge_a['刑期'])))
+        truth = extract_labels(test_case)
+        results.append(prediction_a)
+        labels.append(truth)
+
+        test_case_id = test_case['origin_data'].get('case_id', 'unknown')
+        logging.info(f"test_case_id: {test_case_id}")
+        similar_case_ids = [str(result["id"]) for result in similar_cases]
+        logging.info(f"similar_case_ids: {', '.join(similar_case_ids)}")
+        logging.info(f"法官a预测: {prediction_a} | 真实: {truth}")
+
+    except Exception as e:
+        print(f"Error processing case: {e}")
+
+async def process_test_cases():
+    tasks = []
+    batch_size = 30
+
+    with open('<LOCAL_PATH>/test_data_with_embedding_1.jsonl', 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc="处理测试案例", miniters=100):
+            test_case = json.loads(line)
+            tasks.append(process_case(test_case, client, cases, targets, indices, results, labels))
+
+            if len(tasks) == batch_size:
+                await asyncio.gather(*tasks)
+                tasks.clear()
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    accu_file_path = '<LOCAL_PATH>/acc.txt'
+    law_file_path = '<LOCAL_PATH>/law.txt'
+
+    accu_content = []
+    law_content = []
+    with open(accu_file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip()
+            accu_content.append(line)
+    print("读取罪名txt完毕")
+    with open(law_file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = line.strip()
+            law_content.append(line)
+    print("读取法条txt完毕")
+    logger = asyncio.run(get_logger(f'<LOCAL_PATH>/judge_A_0909.log'))
+    client = OpenAI(api_key="<API_KEY_REMOVED>",
+                    base_url="https://api.deepseek.com")
+    index_names = ["fact", "behavior", "consequence"]
+    indices = {}
+    cases, targets = [], []
+    results, labels = [], []
+    for name in index_names:
+        indices[name] = faiss.read_index('<LOCAL_PATH>/index' + f"{name}.index")
+        print(f"{name} 索引加载完成")
+
+    with open('<LOCAL_PATH>/train_data_element.jsonl', "r", encoding="utf-8") as f:
+        for line in tqdm(f, desc="处理检索案例"):
+            case = json.loads(line)
+            cases.append(case["data"]["elements"]["犯罪事实"])
+            targets.append(case['data']['crime_info'])
+
+    # 假设已加载cases和targets
+    asyncio.run(process_test_cases())
