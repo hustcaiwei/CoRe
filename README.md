@@ -1,48 +1,34 @@
 # CoRe
 
-**Collaborative Reasoning with Reranked Multi-facet Retrieval for Legal Judgment Prediction**
+Code for **Collaborative Reasoning with Reranked Multi-facet Retrieval for Legal Judgment Prediction** (EMNLP 2026).
 
-Wei Cai, Zihan Mei, Haojun Huang, and Bang Wang · EMNLP 2026
+Wei Cai, Zihan Mei, Haojun Huang, and Bang Wang
 
-[中文说明](README.zh-CN.md) · [Data format](docs/data.md)
+[中文](README.zh-CN.md) · [Data format](docs/data.md)
 
-CoRe predicts charges, applicable law articles, and terms of penalty through
-case element extraction, multi-facet precedent retrieval, reciprocal reranking,
-and collaborative reasoning by two LLM judges.
+![CoRe](assets/overview.png)
 
-![CoRe framework](assets/overview.png)
+CoRe extracts behavior, consequence, and fact from each case, then retrieves
+precedents for each of these three facets. RPR combines their rankings over the
+shared candidates. Judge A makes an initial prediction; Judge B selects
+precedents that match A's charge and article sets, and revises the judgment.
+When fewer than K precedents match, the remaining places are filled from the
+first round.
 
-## Method
+For MultiLJP, each record pairs the full case description with one defendant.
+It keeps that defendant's complete charge and article sets and final penalty.
+Both judges predict penalty months, which are converted to 11 intervals for evaluation.
 
-| Module | Description |
-| --- | --- |
-| CEE | Extract behavior, consequence, and fact; evaluate and repair extracted elements |
-| MPR | Retrieve precedents through three independent `IndexFlatL2` indices |
-| RPR | Rerank candidates shared by all three lists using reciprocal rank scores |
-| CRJ | Judge A predicts; Judge B reselects precedents and refines the judgment |
+The default settings are DeepSeek-V3, temperature 0.1, and
+`text-embedding-ada-002` with 1536 dimensions. Retrieval uses squared L2 distance,
+with M=5000, K=19, and alpha=60. CEE uses DeepSeek-V4-Pro to review extractions
+and DeepSeek-V4-Flash for repairs. Extractions are retained when their overall
+score is at least 4 and no severe hallucination is detected.
+Settings are in [`configs/paper.json`](configs/paper.json).
 
-MultiLJP uses one instance per defendant, with the complete case description and
-target defendant. Charge and law-article labels are sets; each defendant has one
-final penalty. Both judges output penalty months, which are mapped to 11 intervals
-for evaluation. Judge B selects precedents with matching charge and article sets;
-if fewer than K match, unused first-round precedents fill the remaining positions.
+## Setup
 
-Default settings in [`configs/paper.json`](configs/paper.json):
-
-| Setting | Value |
-| --- | --- |
-| Extraction / judgment model | `deepseek-v3` |
-| Extraction / Judge A / Judge B temperature | 0.1 / 0.1 / 0.1 |
-| Embedding model / dimensions | `text-embedding-ada-002` / 1536 |
-| Retrieval M / selection K / smoothing alpha | 5000 / 19 / 60 |
-| Candidate scope / distance | Intersection / squared L2 |
-| CEE evaluator / temperature / maximum output tokens | `deepseek-v4-pro` / 0 / 4096 |
-| CEE retention | Overall score >=4 and no severe hallucination |
-| CEE repair model / temperature | `deepseek-v4-flash` / 0 |
-
-## Installation
-
-Python 3.10+ is required. Retrieval uses CPU FAISS.
+Requires Python 3.10+ and CPU FAISS.
 
 ```bash
 python -m venv .venv
@@ -52,11 +38,7 @@ python -m pip install -e .
 python -m core --help
 ```
 
-`core-ljp` is also available as a command-line entry point.
-
-## API configuration
-
-Set the LLM and embedding credentials in your shell:
+Set your API keys and endpoints:
 
 ```powershell
 $env:CORE_LLM_API_KEY = "YOUR_LLM_KEY"
@@ -67,58 +49,61 @@ $env:CORE_EMBEDDING_BASE_URL = "https://api.openai.com/v1"
 $env:CORE_EMBEDDING_MODEL = "text-embedding-ada-002"
 ```
 
-[`.env.example`](.env.example) lists the available variables; it is not loaded
-automatically. CEE evaluation and repair reuse the LLM key and endpoint unless
-`CORE_CEE_EVALUATION_*` or `CORE_CEE_REPAIR_*` is set. Model environment variables
-override configuration values. Use endpoints that support the configured models.
+CEE review and repair use the same LLM credentials by default. To use separate
+endpoints, set `CORE_CEE_EVALUATION_*` and `CORE_CEE_REPAIR_*`.
+See [`.env.example`](.env.example) for the variable names. Export them in your
+shell; the file is not loaded automatically. Model environment variables take
+precedence over the JSON configuration.
 
-## Run
+## Usage
 
-Place the filtered training and test splits in `data/`. Keep all defendants of
-a case in the same split and build indices from training precedents only.
+The commands below use MultiLJP. Put the filtered training and test files in
+`data/`, keeping all defendants of a case in the same split.
 
 ```bash
 python -m core prepare --input data/multi-train.raw.jsonl --format multiljp --output data/train.jsonl
 python -m core prepare --input data/multi-test.raw.jsonl --format multiljp --output data/test.jsonl
 python -m core label-space --input data/train.jsonl --charges-out data/charges.txt --laws-out data/laws.txt
+
 python -m core extract --input data/train.jsonl --output data/train.elements.jsonl --config configs/paper.json
 python -m core extract --input data/test.jsonl --output data/test.elements.jsonl --config configs/paper.json
 python -m core audit --input data/train.elements.jsonl --output data/train.audited.jsonl --config configs/paper.json
 python -m core audit --input data/test.elements.jsonl --output data/test.audited.jsonl --config configs/paper.json
+
 python -m core embed --input data/train.audited.jsonl --output data/train.embeddings.jsonl --config configs/paper.json
 python -m core embed --input data/test.audited.jsonl --output data/test.embeddings.jsonl --config configs/paper.json
 python -m core index --input data/train.embeddings.jsonl --index-dir outputs/train-index --config configs/paper.json
+
 python -m core predict --input data/test.embeddings.jsonl --index-dir outputs/train-index --charges data/charges.txt --output outputs/predictions.jsonl --config configs/paper.json
 python -m core evaluate --truth data/test.jsonl --predictions outputs/predictions.jsonl --output outputs/metrics.json
 ```
 
-For CAIL, use `prepare --format cail`. Indexed labels require
+For CAIL, use `prepare --format cail`. If labels are numeric indices, also pass
 `--charges resources/cail_charges.txt --laws resources/cail_laws.txt`.
-For extracted files without original descriptions, supply `--source-cases`.
-See [data formats and adapters](docs/data.md). API stages support `--limit`;
-output files and index directories must use new paths.
+Use `--source-cases` to attach original descriptions to extracted records.
+[data.md](docs/data.md) describes the input formats and evaluation metrics.
+API stages accept `--limit` for small runs. Outputs are not overwritten.
 
-Charge/article Accuracy measures exact label-set match; macro precision, recall,
-and F1 are averaged per label. Penalties are evaluated over 11 interval classes.
-Failed or missing predictions count as incorrect, with coverage reported separately.
+To run the tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Example
 
-The case concerns a found VIVOX5 phone and an unauthorized Alipay withdrawal of
-3,723 yuan. The defendant's family compensates the victim in full and obtains
-forgiveness.
+After finding a VIVOX5 phone, the defendant steals 3,723 yuan through Alipay's
+password-free payment service. The family later compensates the victim in full
+and obtains forgiveness.
 
-- [Case and extracted elements](examples/query.elements.jsonl)
-- [Training precedents](examples/train.jsonl)
-- [Prediction output example](examples/predictions.jsonl)
+[Case and elements](examples/query.elements.jsonl) ·
+[Precedents](examples/train.jsonl) ·
+[Output](examples/predictions.jsonl)
 
-| Judge | Charge | Article | Penalty (months) |
+| Judge | Charge | Article | Months |
 | --- | --- | --- | --- |
 | A | Theft | 264 | 12 |
 | B | Snatch | 267 | 6 |
-
-The JSON output stores charge/article labels as arrays and each defendant's
-penalty as a scalar. Run `audit` before embedding the example elements.
 
 ## Results
 
@@ -126,16 +111,6 @@ penalty as a scalar. Run `audit` before embedding the example elements.
 | --- | --- | --- | --- |
 | CAIL-Small | 88.51 / 87.29 | 88.22 / 82.37 | 43.20 / 38.20 |
 | MultiLJP | 90.70 / 85.45 | 94.09 / 77.86 | 38.23 / 36.30 |
-
-## Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-The tests exercise multi-label parsing, CEE repair, FAISS retrieval, reranking,
-Judge B selection, penalty conversion, and evaluation with offline API fixtures.
-GitHub Actions runs the same checks.
 
 ## Citation
 

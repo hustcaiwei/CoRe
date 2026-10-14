@@ -1,6 +1,6 @@
 # Data format
 
-Use UTF-8 JSONL, with one object per line and a unique string `id`.
+Data files use UTF-8 JSONL: one record per line, with a unique string `id`.
 
 ## Records
 
@@ -21,19 +21,18 @@ Use UTF-8 JSONL, with one object per line and a unique string `id`.
 }
 ```
 
-Top-level `fact` is the original case description. `elements` contains behavior,
-consequence, and the extracted fact summary. `labels` is required for training
-and evaluation, and omitted from unlabeled queries.
+`fact` holds the original case description. After extraction, `elements` holds
+three strings: `behavior`, `consequence`, and `fact` (the summary). Training and
+evaluation records need `labels`; unlabeled queries do not.
 
-Charge and law-article labels are arrays; scalar input labels are normalized to
-arrays. Charge names omit the trailing `罪`. `term_months` is one final penalty
-per defendant. Multiple unassigned penalties are rejected. `prepare` computes
-`term_class` from months.
+Charges and articles are stored as arrays, including when there is only one
+label. Charge names omit the trailing `罪`. Each defendant has one final
+`term_months` value. `prepare` converts it to `term_class`. Multiple penalties
+without a defendant assignment are rejected.
 
-For MultiLJP, retain `dataset="multiljp"`, `origin_id`, and `defendant`. Each
-defendant has a separate ID, the complete original case description, all its
-charge/article labels, and its own final penalty. Keep all defendants within
-the original case's training/test split.
+MultiLJP records also carry `dataset="multiljp"`, `origin_id`, and `defendant`.
+Each defendant gets a separate ID and keeps the full case description, complete
+label sets, and final penalty. Defendants from the same case stay in the same split.
 
 ## Input adapters
 
@@ -48,7 +47,7 @@ the original case's training/test split.
 Official CAIL law articles are article numbers. Preprocessed CAIL `accu` and
 `law` indices use the ordered tables in `resources/cail_charges.txt` (119 entries)
 and `resources/cail_laws.txt` (103 entries). `term_cate`: 0 death, 1 life,
-2 fixed-term imprisonment. Predicted labels are not training/evaluation truth.
+2 fixed-term imprisonment. Training and evaluation use annotated labels.
 
 If extracted inputs lack original descriptions, join raw cases by `id` (CAIL)
 or `origin_id` (MultiLJP):
@@ -57,17 +56,19 @@ or `origin_id` (MultiLJP):
 python -m core prepare --input data/elements.jsonl --format multiljp-elements --source-cases data/raw.jsonl --output data/prepared.jsonl
 ```
 
-`--source-cases` requires unique `id` and original `fact` fields. Missing original
-cases fail preparation. Use the filtered dataset splits and export their label
-catalogs with `label-space`; the adapters perform schema conversion.
+The source file must contain unique `id` values and the original `fact` text.
+Every extracted record must have a matching source case. Use `label-space` to
+export charge and article lists from the prepared training split.
 
 ## Extraction and embedding
 
-`extract` creates three nonempty text facets. `audit` evaluates them against the
-original description and repairs flagged elements. `cee_validated=true` indicates
-a valid schema after retention or repair; repaired text is not evaluated again.
-`embed` requires this audit flag and adds three vectors plus `embedding_model`.
-Training and query vectors must share their model and dimension.
+`extract` produces the three elements. `audit` checks them against the original
+case and repairs those that need correction. It sets `cee_validated=true` when
+the retained or repaired output has three nonempty text fields. Repairs do not
+receive a second evaluation.
+
+`embed` reads audited records and adds a vector for each element, along with
+`embedding_model`. Training and query vectors must use the same model and dimension.
 
 ## Penalty intervals
 
@@ -88,20 +89,22 @@ Both judges output months. Death is -1; life imprisonment is 360 months.
 | 10 | 0 |
 
 Chinese terms such as `有期徒刑一年十个月` and `拘役三个月` are accepted.
-Suspension periods are excluded; ambiguous combined terms require explicit months.
+Only the custodial term is counted, excluding any suspension period. For
+ambiguous combined terms, supply the final penalty in months.
 
 ## Predictions and evaluation
 
-[Prediction example](../examples/predictions.jsonl) shows both judges' labels and
-penalties. Inference also records precedent IDs, raw responses, and run configuration.
-Query truth never enters model prompts.
+[Prediction records](../examples/predictions.jsonl) contain the labels and
+penalties from both judges. A run also saves precedent IDs, raw responses, and
+configuration. Query labels are kept out of the prompts.
 
-API-stage failures are written as `status="error"` with an error message, and
-return nonzero CLI status. Failed records require correction/reprocessing before
-indexing. Input files and outputs require unique IDs; existing outputs are not overwritten.
+An API-stage failure produces a record with `status="error"` and an error
+message. The command returns a nonzero exit code. Fix and rerun failed records
+before indexing. Duplicate IDs and existing output paths cause an error.
 
-Evaluation joins truth and predictions by ID. Charge/article Accuracy is exact
-set match; macro precision/recall/F1 average over observed truth and predicted
-labels. Penalty Accuracy matches intervals, with macro metrics over all 11 classes.
-Failed/missing predictions count as incorrect. Scores are percentages; coverage
-is a fraction. Unknown IDs and malformed successful outputs are rejected.
+Evaluation matches predictions to annotated records by ID. Charge and article
+Accuracy require an exact set match; macro precision, recall, and F1 average
+over the labels present in annotations or predictions. Penalty Accuracy compares
+intervals, and its macro metrics use all 11 classes. Failed or missing predictions
+count as incorrect. Scores are percentages; coverage is a fraction. Prediction
+IDs must appear in the annotations, and successful records must have valid fields.
