@@ -1,0 +1,3 @@
+{"id": "precedent-theft-withdrawal", "fact": "The defendant stole the victim's property and made unauthorized withdrawals or transactions.", "labels": {"charge": ["盗窃"], "law_article": [264], "term_months": 8, "term_class": 8}}
+{"id": "precedent-robbery", "fact": "The defendant committed robbery by forcefully taking the victim's mobile phone and demanding money.", "labels": {"charge": ["抢劫"], "law_article": [263], "term_months": 12, "term_class": 7}}
+{"id": "precedent-theft-house", "fact": "The defendant unlawfully entered the victim's house at night and took several valuable items without permission.", "labels": {"charge": ["盗窃"], "law_article": [264], "term_months": 10, "term_class": 7}}
