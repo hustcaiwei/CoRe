@@ -12,6 +12,7 @@ retrieval scope, penalty units, and CEE evaluation/repair workflow.
 - `python -m compileall -q core tests` completed successfully.
 - `python -m pip check` reports no broken requirements.
 - Both `python -m core --help` and `core-ljp --help` expose the unified pipeline.
+- GitHub Actions also passed on Ubuntu with Python 3.12 for code commit `cb18e09`: [successful workflow](https://github.com/hustcaiwei/CoRe/actions/runs/38525002790).
 - `configs/paper.json` matches all defaults in `core/config.py`.
 - Dependency declarations in `pyproject.toml` and `requirements.txt` agree.
 - Relative Markdown links and reference-map targets resolve.
@@ -52,9 +53,10 @@ review also exercised original-description joins for both CAIL and MultiLJP.
 
 Full benchmark scores, semantic quality of live LLM outputs, historical model
 availability, and original filtered-label manifests were not established.
-No paid API calls were made. Linux and the hosted GitHub Actions workflow have
-not been run in this local environment. See
+No paid API calls were made. Hosted Ubuntu verification covers installation,
+compilation, and all 30 offline tests; it does not establish live API behavior. See
 [paper_alignment.md](paper_alignment.md) for required reproduction inputs.
 
-This document describes the local prepared repository. It does not assert that
-these files have been pushed to the user's GitHub repository.
+The prepared repository was pushed to `hustcaiwei/CoRe` on `main` using the
+owner's authenticated Git session. The original remote history was retained.
+Local and remote code commits matched, with all 55 curated files published.
